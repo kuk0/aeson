@@ -303,27 +303,31 @@ encodeUtf8BuilderEscaped be =
             goPartial !iendTmp = go i0 op0
               where
                 go !i !op
-                  | i < iendTmp = case A.unsafeIndex arr i of
-                      w | w <= 0x7F ->
-                            BP.runB be (fromIntegral w) op >>= go (i + 1)
-                        | w <= 0x7FF -> do
-                            poke8 0 $ (w `shiftR` 6) + 0xC0
-                            poke8 1 $ (w .&. 0x3f) + 0x80
-                            go (i + 1) (op `plusPtr` 2)
-                        | 0xD800 <= w && w <= 0xDBFF -> do
-                            let c = ord $ U16.chr2 w (A.unsafeIndex arr (i+1))
-                            poke8 0 $ (c `shiftR` 18) + 0xF0
-                            poke8 1 $ ((c `shiftR` 12) .&. 0x3F) + 0x80
-                            poke8 2 $ ((c `shiftR` 6) .&. 0x3F) + 0x80
-                            poke8 3 $ (c .&. 0x3F) + 0x80
-                            go (i + 2) (op `plusPtr` 4)
+                  | i < iendTmp = case a of
+                      a | a <= 0x7F ->
+                          BP.runB be (fromIntegral a) op >>= go (i + 1)
+                        | 0xC2 <= a && a <= 0xDF -> do
+                            poke8 0 a
+                            poke8 1 b
+                            go (i + 2) (op `plusPtr` 2)
+                        | 0xE0 <= a && a <= 0xEF -> do
+                            poke8 0 a
+                            poke8 1 b
+                            poke8 2 c
+                            go (i + 3) (op `plusPtr` 3)
                         | otherwise -> do
-                            poke8 0 $ (w `shiftR` 12) + 0xE0
-                            poke8 1 $ ((w `shiftR` 6) .&. 0x3F) + 0x80
-                            poke8 2 $ (w .&. 0x3F) + 0x80
-                            go (i + 1) (op `plusPtr` 3)
+                            poke8 0 a
+                            poke8 1 b
+                            poke8 2 c
+                            poke8 3 d
+                            go (i + 4) (op `plusPtr` 4)
                   | otherwise =
                       outerLoop i (B.BufferRange op ope)
                   where
                     poke8 j v = poke (op `plusPtr` j) (fromIntegral v :: Word8)
+                    a = A.unsafeIndex arr i
+                    b = A.unsafeIndex arr (i+1)
+                    c = A.unsafeIndex arr (i+2)
+                    d = A.unsafeIndex arr (i+3)
+
 #endif

@@ -50,24 +50,19 @@ import Data.Scientific (Scientific, base10Exponent, coefficient)
 import Data.Time (UTCTime(..))
 import Data.Time.Calendar (Day(..), toGregorian)
 import Data.Time.LocalTime
-import Data.Word (Word8)
+import Data.Word (Word8, Word64)
 import qualified Data.HashMap.Strict as HMS
 import qualified Data.Text as T
 import qualified Data.Vector as V
 
-#if MIN_VERSION_bytestring(0,10,4)
-import Data.Text.Encoding (encodeUtf8BuilderEscaped)
-#else
-import Data.Bits ((.&.))
+import Data.Bits hiding (shiftR, shiftL)
 import Data.Text.Internal (Text(..))
-import Data.Text.Internal.Unsafe.Shift (shiftR)
-import Foreign.Ptr (minusPtr, plusPtr)
+import Data.Text.Internal.Unsafe.Shift (shiftR, shiftL)
+import Foreign.Ptr (minusPtr, plusPtr, castPtr)
 import Foreign.Storable (poke)
 import qualified Data.ByteString.Builder.Internal as B
 import qualified Data.ByteString.Builder.Prim.Internal as BP
 import qualified Data.Text.Array as A
-import qualified Data.Text.Internal.Encoding.Utf16 as U16
-#endif
 
 -- | Encode a JSON value to a "Data.ByteString" 'B.Builder'.
 --
@@ -269,7 +264,36 @@ twoDigits a     = T (digit hi) (digit lo)
 digit :: Int -> Char
 digit x = chr (x + 48)
 
-#if !(MIN_VERSION_bytestring(0,10,4))
+notEscaped :: Word64 -> Bool
+notEscaped x = hasless x 0x20 == 0
+            && hasvalue x 92 == 0 -- \
+            && hasvalue x 34 == 0 -- "
+{-# INLINE notEscaped #-}
+
+pat80 :: Word64
+pat80 = 0x8080808080808080
+{-# INLINE pat80 #-}
+
+pat01 :: Word64
+pat01 = 0x0101010101010101
+{-# INLINE pat01 #-}
+
+pat :: Word64 -> Word64
+pat n = pat01 * n
+{-# INLINE pat #-}
+
+hasless :: Word64 -> Word64 -> Word64
+hasless x n = ((x - pat n) .&. complement x) .&. pat80
+{-# INLINE hasless #-}
+
+haszero :: Word64 -> Word64
+haszero x = hasless x 1
+{-# INLINE haszero #-}
+
+hasvalue :: Word64 -> Word64 -> Word64
+hasvalue x n = haszero $ x `xor` (pat n)
+{-# INLINE hasvalue #-}
+
 -- | Encode text using UTF-8 encoding and escape the ASCII characters using
 -- a 'BP.BoundedPrim'.
 --
@@ -292,17 +316,30 @@ encodeUtf8BuilderEscaped be =
 
         outerLoop !i0 br@(B.BufferRange op0 ope)
           | i0 >= iend       = k br
-          | outRemaining > 0 = goPartial (i0 + min outRemaining inpRemaining)
+          | outRemaining > 0 = goPartial iendTmp (iendTmp `shiftR` 3)
           -- TODO: Use a loop with an integrated bound's check if outRemaining
           -- is smaller than 8, as this will save on divisions.
           | otherwise        = return $ B.bufferFull bound op0 (outerLoop i0)
           where
             outRemaining = (ope `minusPtr` op0) `div` bound
             inpRemaining = iend - i0
+            iendTmp = (i0 + min outRemaining inpRemaining)
 
-            goPartial !iendTmp = go i0 op0
+            goPartial !iendTmp !iendTmp64 = go i0 op0
               where
+                go64 !j !op
+                  | j < iendTmp64 && w .&. pat80 == 0 && notEscaped w = do
+                      poke64 w
+                      go64 (j+1) (op `plusPtr` 8)
+                  | otherwise = go (j `shiftL` 3) (castPtr op)
+                  where
+                    poke64 v = poke op (v :: Word64)
+                    w = A.unsafeIndex64 arr j
+
                 go !i !op
+                  | i .&. 7 == 0 && i + 7 < iendTmp && w .&. pat80 == 0 && notEscaped w = do
+                      poke64 w
+                      go64 ((i `shiftR` 3) + 1) (castPtr $ op `plusPtr` 8)
                   | i < iendTmp = case a of
                       a | a <= 0x7F ->
                           BP.runB be (fromIntegral a) op >>= go (i + 1)
@@ -324,10 +361,10 @@ encodeUtf8BuilderEscaped be =
                   | otherwise =
                       outerLoop i (B.BufferRange op ope)
                   where
-                    poke8 j v = poke (op `plusPtr` j) (fromIntegral v :: Word8)
+                    poke64 v = poke (castPtr op) (v :: Word64)
+                    poke8 j v = poke (op `plusPtr` j) (v :: Word8)
+                    w = A.unsafeIndex64 arr (i `shiftR` 3)
                     a = A.unsafeIndex arr i
                     b = A.unsafeIndex arr (i+1)
                     c = A.unsafeIndex arr (i+2)
                     d = A.unsafeIndex arr (i+3)
-
-#endif
